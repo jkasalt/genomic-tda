@@ -1,0 +1,309 @@
+---
+title: "An analysis of differentially expressed genes in Huntington's disease patients and control patients, followed by a gene clustering of the diseased patients"
+author: "Luca Bracone"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+    bookdown::pdf_document2:
+        toc: false
+header-includes:
+    - \usepackage{subfig}
+bibliography: references.bib
+nocite: '@*'
+geometry: margin=2.5cm
+fontsize: 12pt
+---
+
+\newcommand{\argmin}[1]{\underset{#1}{\operatorname{argmin}}}
+\newcommand{\med}{\operatorname{med}}
+
+```{r setup, include = FALSE}
+set.seed(112233)
+library(affy)
+library(affyPLM)
+library(limma)
+library(knitr)
+library(hgu133a.db)
+library(annotate)
+opts_chunk$set(autodep = TRUE, echo = FALSE, fig.align = "center")
+```
+
+```{r load, cache = TRUE}
+affybatch <- ReadAffy(celfile.path = "Alter")
+sampleNames(affybatch) <- seq_len(length(sampleNames(affybatch)))
+targets <- scan("Alter.txt", what = list(chip = "", num = "", fc = "", kind =
+                                         "", a = ""))
+```
+
+# Introduction
+Huntington's disease is a hereditary and currently incurable neurodegenerative
+disease whose symptoms usually first appear between 30 to 50 years of age. The
+first symptoms are usually mood disorders and a general lack of coordination.
+They devolve into dementia and a total inability to perform coordinated movement.
+
+In this report, we will perform two analyses using Affymetrix™ `r cdfName(affybatch)` microchips with `r length(featureNames(affybatch))` probe
+sets, of which `r sum(targets$kind == "BA9")` are control and `r sum(targets$kind == "BA4")` are diseased. These arrays have “probe” strands of
+RNA on which we apply DNA material that is relevant to our experiment. If the
+DNA and RNA match, they will bind strongly, otherwise they will not. Using fluorescence we can record
+this information into a computer. This is the data we analyze here. Firstly, we
+will analyze which genes are differentially expressed between patients of this
+disease and control patients. Secondly, among those affected by Huntington's
+disease, we will perform a clustering analysis to see if we can discover
+subgroups of genes.
+The reader may find more information about the software we used in the References
+section.
+
+
+# Quality Assessment
+
+```{r plm, cache = TRUE}
+pset <- fitPLM(affybatch)
+```
+
+We fit a “probe-level” model to the data:
+\[ \log_2(PM_{i,j}) = c_{i,j} + p_j + \epsilon_{i,j} \]
+Where $c_{i,j}$ is the $\log_2$ intensity for probe set $i$ on chip $j$ and $p_j$ represents an effect per probe.
+For identifiability, the model is fit with the following constraint $\sum_{j} p_j = 0$.
+The parameters are estimated using robust regression. That is, we look for solutions to the following problem:
+\[ \argmin{p_j, c_{i,j}} \sum_{i,j} \rho \left( \frac{PM_{i,j} - p_j - c_{i,j}}{\hat \sigma} \right) \]
+Where $\rho$ may be any loss function but here we decide it to be the Huber function, and $\hat \sigma$ is a robust estimate of scale such as the median absolute deviation.
+
+To compute such a solution, a numerical method is required. We use iterative re-weighted least squares (IRLS):
+let $w(u) = \frac{1}{u} \cdot \frac{d \rho}{d u}(u)$, the weight function corresponding to our loss function $\rho$. Then,
+
+1. Obtain initial estimates $c_{i,j}^{(0)}$ and $p_j^{(0)}$.
+2. Compute $u_i^{(0)} = \left(PM_{i,j} - c_{i,j}^{(0)} - p_j^{(0)}\right) / MAD\left(PM_{i,j} - c_{i,j}^{(0)} - p_j^{(0)}\right)$.
+3. Obtain weights $w_i^{(0)} = w\left(u_i^{(0)}\right)$.
+4. Perform weighted least squares with the $w_i^{(0)}$ to find new estimates $c_{i,j}^{(1)}$ and $p_j^{(1)}$.
+5. Iterate until satisfied.
+
+Then, chips that have a large number of low-weighted probes stand out from the
+other chips. They are considered to be of bad quality and discarded from the rest of the analysis. On Figure \@ref(fig:plot-pseudo) we illustrate the results of this procedure.
+
+```{r plot-pseudo, dev = "CairoJPEG", dpi = 200, cache = TRUE, fig.cap = "Pseudo-images of the weights associated to each probe. The greener a pixel is, the more of an outlier this probe is.", fig.ncol = 2, fig.subcap = "", out.width = "50%"}
+par(mar = c(1,1,1,1), pty = "s", mfrow = c(5, 5))
+image(pset)
+```
+
+Another measure of quality is the normalized unscaled standard error (NUSE): For each gene $i$ on array $j$, using the standard error estimates for $c_{i,j}$ obtained in the probe-level model we compute the ratio of the standard error of $c_{i,j}$ with the median standard error of $c_{i,j}$ across chips.
+\[ NUSE(c_{i,j}) = \frac{SE(c_{i,j})}{\med_j(SE(c_{i,j}))}. \]
+This gives a set of values that we group by array and we present it in the form of box plots on Figure \@ref(fig:plot-nuse).
+
+```{r plot-nuse, cache = TRUE, out.width = "100%", fig.cap = "NUSE values of each chip"}
+par(mar = c(3,2,3,0), cex = 0.5)
+NUSE(pset)
+abline(h = 1.05, col ="blue", lty = 5)
+```
+
+As we can see, only chip 52 exceeds the threshold of 1.05 median nuse value, so we exclude it from the rest of the study.
+
+# Normalization
+Normalization is a three step process. First, we only consider perfect match (PM) probes. Second, we model each observed PM intensity on a “background” model: $S = X + Y$, where $X \sim Exp(\alpha)$ and $Y \sim N(\mu, \sigma^2)$.
+$X$ represents the “true” intensity and $Y$ some background noise that is the same per chip.
+We adjust each observed intensity to its prediction $X$ according to this model.
+Finally, we move each quantile to its mean across chips.
+This helps to alleviate artifactual differences between chips.
+On Figure \@ref(fig:before-after-rma) we see the result of this process.
+
+```{r compute-rma, cache = TRUE, include = FALSE}
+data.trimmed <- affybatch[,-52]
+eset <- rma(data.trimmed)
+id <- featureNames(eset)
+symbol <- getSYMBOL(id, "hgu133a.db")
+fData(eset) <- data.frame(Symbol = symbol)
+has_symbol <- !is.na(fData(eset)$Symbol)
+eset <- eset[has_symbol,]
+eset.exprs <- exprs(eset)
+```
+
+```{r before-after-rma, fig.cap = "Boxplots of the log intensities of each chip before (left) and after (right) normalization"}
+par(mfrow = c(1,2), pty = "s")
+boxplot(data.trimmed)
+boxplot(eset)
+```
+
+
+# Analysis of differentially expressed genes
+
+```{r compute-fit, include = FALSE, cache = TRUE}
+kind <- factor(targets$kind, levels = c("BA9", "BA4"))
+model <- model.matrix(~ kind)
+model <- model[-52,]
+fit <- lmFit(eset, model)
+fit <- eBayes(fit, trend = TRUE, robust = TRUE)
+results <- decideTests(fit)
+sumr <- summary(results)
+regs <- sumr[,"kindBA4"]
+```
+
+An MDS plot shows there is no batch effect between chips.
+Since we are only interested in differential expression of genes between control and Huntington disease patients, we fit a linear model that only takes this difference into account
+\[ y_g = \beta_0 + \beta_1 I(\text{is diseased}) + \epsilon_g. \]
+Where $y_g$ is the average log expression level of gene $g$ across chips.
+Then, the design matrix is
+\[ A_{i,j} =
+\begin{cases}
+1 &\text{ if } i=1 \\
+1 &\text{ if } i=2 \text{ and } j > 30 \\
+0 &\text{ otherwise. }
+\end{cases} \]
+After fitting the model, for each gene $g$, we calculate the posterior variance estimate
+\[ \tilde s_g^2 = \frac{d_0 s_0^2 + d_g s_g^2}{d_0 + d_g}\]
+where $s_0^2$ is the estimated average variability across all genes, $s_g^2$ is the estimated variability for that specific gene, $d_0$, and $d_g$ are the degrees of freedom for $s_0$ and $s_g$ respectively.
+Using this we calculate the moderated $t$-statistic
+\[ \tilde t_g = \frac{\hat \beta_g}{\tilde s_g \sqrt{v_g}} \]
+where $\hat \beta_g$ is the average difference of $\log_2$ gene intensity between the two groups we are comparing, for the gene $g$. The coefficient $v_g$ is the entry in the covariance matrix corresponding to $g$.
+We use $\tilde t_g$ rather than the usual $t$-statistic because in micro-array experiments a lot of genes have low variance and this causes the usual $t$-statistic to be extremely large.
+The statistics $\tilde t_g$ have a known distribution from which we can extract $p$-values.
+We decide to adjust the $p$-values using Benjamini and Hochberg's method.
+Let $m$ be the total number of $p$-values.
+This method involves sorting each $p$-value in ascending order, giving it a rank $i$.
+Then for each $p$-value, calculate $BH(p) = 0.05 \cdot i/m$.
+Finally, we only consider the $p$-values that satisfy $BH(p) < 0.05$ to be significant.
+The results are as follows:
+Out of `r sum(regs)` genes, we find that `r regs["Down"]` are down-regulated and `r regs["Up"]` are up regulated. On page \pageref{tab:top-table}, Table \@ref(tab:top-table) contains a summary of the genes with the highest absolute moderated $t$-statistic.
+On Figure \@ref(fig:plot-volcano) we show a “volcano” plot: the $x$-axis shows the $\log_2$ fold change of each gene, positive or negative, and the $y$-axis shows the $\log_2$ $p$-value according to the moderated $t$-statistic.
+
+```{r plot-volcano, fig.cap = "A plot of $p$-value vs.\ $\\log_2$ fold change"}
+M <- fit$coefficients[,2]
+Bstat <- fit$lods[,2]
+plot(M, Bstat, pch = ".", ylab = "-log2(Pvalue)", xlab = "log2(FC)", main = "Volcano Plot")
+fc <- 1.0
+abline(h = c(0,2,4), lty = 1:3)
+abline(v = c(-fc, fc), lty = 3)
+negM <- (M < -fc)
+posM <- (M > fc)
+bigM <- (abs(M) > fc)
+bigB <- (Bstat > 0)
+gene_names_pos <- fit$genes$Symbol[bigB&posM]
+gene_names_neg <- fit$genes$Symbol[bigB&negM]
+par(pch = 16)
+points(M[bigM&!bigB],Bstat[bigM&!bigB],col="grey")
+points(M[bigB&negM],Bstat[bigB&negM],col="red")
+points(M[bigB&posM],Bstat[bigB&posM],col="blue")
+
+# text(M[bigB&negM],Bstat[bigB&negM], gene_names_pos, pos = 4, cex = 0.5)
+# text(M[bigB&posM],Bstat[bigB&posM], gene_names_neg, pos = 2, cex = 0.5)
+```
+
+# Cluster analysis
+
+We choose to perform a clustering analysis on the 100 genes with the highest
+variance using Ward's method. That is, we consider each gene to be a vector
+whose coordinates are given by the expression levels on each chip. Then, start
+with each gene being a single cluster and bit by bit we increase the “merging
+radius”. When two clusters merge, we record at which radius it happened, the
+results of this procedure are shown in Figure \@ref(fig:plot-cluster). By
+“radius” we mean Ward's mergind cost: \[ \Delta(A,B) = \frac{n_A n_B}{n_A + n_B}
+||m_A - m_B||^2 \] where $n_X$ and $m_X$ are respectively the number of
+elements in cluster $X$ and the barycenter of $X$.
+Looking at Figure \@ref(fig:plot-cluster) it seems reasonable
+to conclude that there are three main clusters being formed
+by taking for radius $\Delta \approx 100$.
+But we would need to consult with a biologist to see if such a
+categorization has theoretical merit.
+On page \pageref{fig:plot-heatmap}, Figure \@ref(fig:plot-heatmap) illustrates a heat map. It is essentially a color
+representation of the matrix that has a row for each gene, a column for each chip, and
+each entry is equal to the average $\log_2$ intensity of that gene on that chip.
+If the gene names are too small to read on paper, note that they appear in the same order as in Figure \@ref(fig:plot-cluster).
+From the heatmap, we find that there are group of genes which appear mutually exclusively (if one is there the other one is not).
+
+```{r compute-cluster, cache = TRUE}
+sigmas <- fit$sigma
+sigmas.sorted <- names(head(sort(sigmas, decreasing = TRUE), n = 100))
+trgt <- targets$kind[-52]
+hunt <- eset[sigmas.sorted, trgt == "BA4"]
+hunt.exprs <- exprs(hunt)
+rownames(hunt.exprs) <- getSYMBOL(rownames(hunt.exprs), "hgu133a.db")
+clust.euclid.ward <- as.dendrogram(hclust(dist(hunt.exprs), method = "ward.D"))
+clust.euclid.ward.samples <- as.dendrogram(hclust(dist(t(hunt.exprs)), method = "ward.D"))
+```
+
+```{r plot-cluster, fig.cap = "A dendrogram of the genes with highest variance using Ward's method"}
+par(cex = 0.35)
+plot(clust.euclid.ward)
+```
+
+```{r plot-heatmap, fig.cap = "A heatmap of the 100 genes with higest variance, with respect to dendrograms using Ward's method, the gene names are the same as in Figure 5 so that left $\\rightarrow$ right appears as down $\\rightarrow$ up"}
+heatmap(hunt.exprs, Rowv = clust.euclid.ward, Colv = clust.euclid.ward.samples, col = topo.colors(23), cexRow = 0.25, cexCol = 0.5)
+```
+
+# Conclusion
+After performing a robust linear model fitting, we discarded one low-quality chip.
+Then, we normalized the samples so that they were as similar as possible to each other.
+Then, we fit a linear model to express the difference between the two groups of interest.
+We found that `r regs["Down"]` genes are down-regulated and `r regs["Up"]` are up-regulated.
+Finally we performed a clustering analysis of the 100 genes with highest variance among Huntington's disease patients.
+We found that it may be interesting to perform a study into a possible relationship of the genes in a classification in three clusters.
+Although we found a grouping while performing clustering analysis it remains unclear if it is not simply magical thinking. 
+Consulting with a biologist and performing more experiments would be required.
+```{r, include = FALSE}
+tabl <- topTable(fit, n = 50, sort.by = "t", coef = "kindBA4")
+tabl$P.Value <- format(tabl$P.Value, digits = 3)
+tabl$adj.P.Val <- format(tabl$adj.P.Val, digits = 3)
+```
+
+```{r top-table}
+kable(tabl, "simple", digits = c(2,2,2,2,12,12,2), caption = "The 50 most differentially expressed genes")
+```
+
+# References
+```{r citations, include = FALSE}
+write_bib(c("affy", "affyPLM", "limma", "knitr", "hgu133a.db", "annotate", "base", "bookdown", "rmarkdown"), file = "references.bib")
+```
+
+```{r, include = FALSE}
+sessionInfo()
+# R version 4.1.0 (2021-05-18)
+# Platform: x86_64-pc-linux-gnu (64-bit)
+# Running under: Arch Linux
+#
+# Matrix products: default
+# BLAS:   /usr/lib/libblas.so.3.9.1
+# LAPACK: /usr/lib/liblapack.so.3.9.1
+#
+# locale:
+#  [1] LC_CTYPE=en_US.UTF-8       LC_NUMERIC=C
+#  [3] LC_TIME=en_US.UTF-8        LC_COLLATE=en_US.UTF-8
+#  [5] LC_MONETARY=en_US.UTF-8    LC_MESSAGES=en_US.UTF-8
+#  [7] LC_PAPER=en_US.UTF-8       LC_NAME=C
+#  [9] LC_ADDRESS=C               LC_TELEPHONE=C
+# [11] LC_MEASUREMENT=en_US.UTF-8 LC_IDENTIFICATION=C
+#
+# attached base packages:
+# [1] stats4    parallel  stats     graphics  grDevices utils
+# [7] datasets  methods   base
+#
+# other attached packages:
+#  [1] hgu133acdf_2.18.0     annotate_1.70.0
+#  [3] XML_3.99-0.6          hgu133a.db_3.13.0
+#  [5] org.Hs.eg.db_3.13.0   AnnotationDbi_1.54.0
+#  [7] IRanges_2.26.0        S4Vectors_0.30.0
+#  [9] knitr_1.33            limma_3.48.0
+# [11] affyPLM_1.68.0        preprocessCore_1.54.0
+# [13] gcrma_2.64.0          affy_1.70.0
+# [15] Biobase_2.52.0        BiocGenerics_0.38.0
+# [17] rmarkdown_2.8         nvimcom_0.9-121
+#
+# loaded via a namespace (and not attached):
+#  [1] KEGGREST_1.32.0        tinytex_0.32
+#  [3] xfun_0.23              splines_4.1.0
+#  [5] vctrs_0.3.8            htmltools_0.5.1.1
+#  [7] yaml_2.2.1             blob_1.2.1
+#  [9] rlang_0.4.11           DBI_1.1.1
+# [11] bit64_4.0.5            affyio_1.62.0
+# [13] GenomeInfoDbData_1.2.6 stringr_1.4.0
+# [15] zlibbioc_1.38.0        Biostrings_2.60.0
+# [17] codetools_0.2-18       evaluate_0.14
+# [19] memoise_2.0.0          fastmap_1.1.0
+# [21] GenomeInfoDb_1.28.0    highr_0.9
+# [23] Rcpp_1.0.6             xtable_1.8-4
+# [25] BiocManager_1.30.15    cachem_1.0.5
+# [27] XVector_0.32.0         bit_4.0.4
+# [29] png_0.1-7              digest_0.6.27
+# [31] stringi_1.6.2          bookdown_0.22
+# [33] tools_4.1.0            bitops_1.0-7
+# [35] magrittr_2.0.1         RCurl_1.98-1.3
+# [37] RSQLite_2.2.7          crayon_1.4.1
+# [39] pkgconfig_2.0.3        httr_1.4.2
+# [41] R6_2.5.0               compiler_4.1.0
+```
